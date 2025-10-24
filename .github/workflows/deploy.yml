@@ -1,0 +1,128 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+  BLACKBOX_API_KEY: ${{ secrets.BLACKBOX_API_KEY }}
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt
+      
+      - name: Run deployment readiness test
+        run: python3 test_deployment.py
+      
+      - name: Run backend tests
+        run: |
+          cd backend
+          pytest --cov=app --cov-report=xml --cov-report=term
+        env:
+          DATABASE_URL: sqlite:///./test.db
+          BLACKBOX_API_KEY: ${{ secrets.BLACKBOX_API_KEY }}
+          SECRET_KEY: test-secret-key-for-ci
+      
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./backend/coverage.xml
+          flags: backend
+          name: backend-coverage
+
+  deploy-backend:
+    name: Deploy Backend to Fly.io
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Fly CLI
+        uses: superfly/flyctl-actions/setup-flyctl@master
+      
+      - name: Deploy backend
+        run: |
+          cd backend
+          flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      
+      - name: Set secrets
+        run: |
+          flyctl secrets set \
+            BLACKBOX_API_KEY="${{ secrets.BLACKBOX_API_KEY }}" \
+            SECRET_KEY="${{ secrets.SECRET_KEY }}" \
+            DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+            REDIS_URL="${{ secrets.REDIS_URL }}" \
+            SENDGRID_API_KEY="${{ secrets.SENDGRID_API_KEY }}" \
+            --app freelancer-feedback-api
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      
+      - name: Run database migrations
+        run: |
+          flyctl ssh console --app freelancer-feedback-api -C "alembic upgrade head"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-frontend:
+    name: Deploy Frontend to Fly.io
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Fly CLI
+        uses: superfly/flyctl-actions/setup-flyctl@master
+      
+      - name: Deploy frontend
+        run: |
+          cd frontend
+          flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  notify:
+    name: Send Deployment Notification
+    needs: [deploy-backend, deploy-frontend]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Notify on success
+        if: ${{ needs.deploy-backend.result == 'success' && needs.deploy-frontend.result == 'success' }}
+        run: |
+          echo "✅ Deployment successful!"
+          echo "Backend: https://freelancer-feedback-api.fly.dev"
+          echo "Frontend: https://freelancer-feedback-app.fly.dev"
+      
+      - name: Notify on failure
+        if: ${{ needs.deploy-backend.result == 'failure' || needs.deploy-frontend.result == 'failure' }}
+        run: |
+          echo "❌ Deployment failed!"
+          exit 1
